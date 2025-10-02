@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -44,6 +45,26 @@ from utils.trigger_loader import load_trigger_words
 from utils.workflow_steps import workflow_step_recorder  # NEU
 
 logger = logging.getLogger("MasterWorkflowAgent")
+
+
+class _RunIdLoggingFilter(logging.Filter):
+    """Ensure log records emitted by the master agent include the active run id."""
+
+    def __init__(self, agent: "MasterWorkflowAgent") -> None:
+        super().__init__()
+        self._agent_ref = weakref.ref(agent)
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401 - std signature
+        agent = self._agent_ref()
+        if agent is None:
+            # No agent available, fall back to existing value or placeholder.
+            record.run_id = getattr(record, "run_id", "n/a") or "n/a"
+            return True
+
+        run_id = getattr(record, "run_id", None)
+        if not run_id or run_id == "n/a":
+            record.run_id = agent.run_id or "n/a"
+        return True
 
 
 class MasterWorkflowAgent:
@@ -118,6 +139,7 @@ class MasterWorkflowAgent:
         self.log_file_path: Path = self.run_directory / "polling_trigger.log"
         self.log_filename: str = str(self.log_file_path)
         self.audit_log: AuditLog
+        self._run_id_filter: Optional[_RunIdLoggingFilter] = None
         self.initialize_run()
 
         self.llm_confidence_thresholds: Dict[str, float] = {}
@@ -155,6 +177,9 @@ class MasterWorkflowAgent:
                 logger.removeHandler(existing_handler)
                 existing_handler.close()
 
+        if self._run_id_filter is not None:
+            logger.removeFilter(self._run_id_filter)
+
         file_handler = logging.FileHandler(
             self.log_file_path, mode="w", encoding="utf-8"
         )
@@ -166,6 +191,9 @@ class MasterWorkflowAgent:
         setattr(file_handler, "_master_agent_handler", True)
         logger.setLevel(logging.INFO)
         logger.addHandler(file_handler)
+
+        self._run_id_filter = _RunIdLoggingFilter(self)
+        logger.addFilter(self._run_id_filter)
 
     async def process_all_events(self) -> List[Dict[str, Any]]:
         logger.info("MasterWorkflowAgent: Processing events...")
