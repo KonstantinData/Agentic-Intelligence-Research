@@ -18,7 +18,9 @@ class ExtractionAgent(BaseExtractionAgent):
     from an event dictionary.
     """
 
-    DOMAIN_REGEX = re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b")
+    # Harden domain regex to handle trailing punctuation and normalization
+    DOMAIN_REGEX = re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?=[.,;:\s\)]|$)")
+    
     STOP_WORDS = {
         "first",
         "second",
@@ -77,7 +79,22 @@ class ExtractionAgent(BaseExtractionAgent):
         "july",
         "august",
         "september",
+        # German function/meeting terms
+        "termin",
+        "besprechung",
+        "treffen",
+        "gespräch",
+        "gesprach",
+        "austausch",
+        "jour",
+        "fixe",
+        "abstimmung",
+        "rücksprache",
+        "rucksprache",
+        "telko",
+        "telefonat",
     }
+    
     COMPANY_SUFFIXES = {
         "inc",
         "inc.",
@@ -94,7 +111,29 @@ class ExtractionAgent(BaseExtractionAgent):
         "gmbh",
         "plc",
         "sa",
+        # DE/EU legal forms
+        "kg",
+        "ohg",
+        "e.k.",
+        "ek",
+        "kgaa",
+        "se",
+        "s.p.a.",
+        "spa",
+        "s.a.",
+        "b.v.",
+        "bv",
+        "nv",
+        "ab",
+        "sas",
+        "oy",
+        "as",
+        "sp. z o.o.",
+        "sp",
+        "z",
+        "o.o.",
     }
+    
     SUBDOMAIN_EXCLUSIONS = {
         "www",
         "app",
@@ -104,6 +143,7 @@ class ExtractionAgent(BaseExtractionAgent):
         "portal",
         "mail",
     }
+    
     SECOND_LEVEL_TLDS = {
         "co",
         "com",
@@ -111,6 +151,18 @@ class ExtractionAgent(BaseExtractionAgent):
         "org",
         "gov",
         "edu",
+        # Common SLD zones
+        "uk",
+        "au",
+        "br",
+        "nz",
+        "za",
+        "in",
+        "jp",
+        "kr",
+        "cn",
+        "mx",
+        "ar",
     }
 
     async def extract(self, event: Dict[str, Any]) -> Dict[str, Any]:
@@ -124,10 +176,13 @@ class ExtractionAgent(BaseExtractionAgent):
 
             # Try to find web domain in a dedicated field or extract from text.
             web_domain = self._normalise_domain(event.get("web_domain"))
+            web_domain_source = "event" if web_domain else None
 
             extracted_domain = self._find_domain_in_text(summary, description)
             if extracted_domain:
-                web_domain = web_domain or extracted_domain
+                if not web_domain:
+                    web_domain = extracted_domain
+                    web_domain_source = "text"
 
             if web_domain:
                 derived_name = self._derive_company_from_domain(web_domain)
@@ -148,12 +203,30 @@ class ExtractionAgent(BaseExtractionAgent):
                 "company_name": company_name,
                 "web_domain": web_domain,
             }
-            is_complete = all(info.values())
+            
+            # Track sources for each field
+            sources = {
+                "company_name": company_name_source or "none",
+                "web_domain": web_domain_source or "none",
+            }
+            
+            # Determine missing required fields
+            required_fields = ["company_name", "web_domain"]
+            missing = [field for field in required_fields if not info.get(field)]
+            
+            is_complete = len(missing) == 0
+            status = "ok" if is_complete else "incomplete"
 
             # Notes:
             # You can extend this logic to extract more fields, or to use more advanced NLP if needed.
 
-            return {"info": info, "is_complete": is_complete}
+            return {
+                "info": info,
+                "is_complete": is_complete,
+                "status": status,
+                "missing": missing,
+                "sources": sources,
+            }
         except Exception as e:
             logging.error(f"Error during info extraction: {e}")
             raise
@@ -231,7 +304,17 @@ class ExtractionAgent(BaseExtractionAgent):
             return None
         # Remove URL scheme if provided.
         domain = re.sub(r"^https?://", "", domain)
+        # Remove trailing punctuation
+        domain = re.sub(r"[.,;:\s\)]+$", "", domain)
         domain = domain.split("/")[0]
+        # Normalize IDN/Punycode domains (convert to ASCII)
+        try:
+            # Handle punycode domains by encoding/decoding
+            if domain.startswith("xn--") or "xn--" in domain:
+                domain = domain.encode("ascii").decode("idna")
+        except (UnicodeError, UnicodeDecodeError):
+            # If decoding fails, keep original
+            pass
         return domain or None
 
     def _derive_company_from_domain(self, domain: str) -> Optional[str]:
@@ -240,8 +323,10 @@ class ExtractionAgent(BaseExtractionAgent):
         if not parts:
             return None
 
+        # Handle second-level TLDs like .co.uk, .com.au, etc.
         candidate_index = -2 if len(parts) >= 2 else -1
         if len(parts) >= 3 and parts[-2] in self.SECOND_LEVEL_TLDS:
+            # e.g., foo.co.uk -> use 'foo'
             candidate_index = -3
         if abs(candidate_index) > len(parts):
             candidate_index = -len(parts)

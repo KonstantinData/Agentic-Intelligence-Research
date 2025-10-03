@@ -2,7 +2,7 @@ import inspect
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from agents.factory import register_agent
 from agents.interfaces import BaseHumanAgent
@@ -78,9 +78,8 @@ class HumanInLoopAgent(BaseHumanAgent):
         self, event: Dict[str, Any], extracted: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
-        Requests missing info from a human. This is a dummy implementation for demonstration.
-        In a real scenario, this could send an email, Slack message, or open a web form.
-        Here, it simulates a user providing the missing information.
+        Requests missing info from a human via email. Returns status="pending"
+        and is_complete=False on sending, with an audit_id for correlation.
 
         Parameters
         ----------
@@ -92,16 +91,21 @@ class HumanInLoopAgent(BaseHumanAgent):
         Returns
         -------
         dict
-            The extracted dictionary with all info fields completed.
+            The extracted dictionary with status="pending", is_complete=False, and audit_id.
         """
         contact = self._extract_organizer_contact(event)
         masked_event = self._mask_for_message(event)
         masked_initial_info = self._mask_for_message(extracted.get("info", {}))
-        requested_fields = [
-            key
-            for key, value in extracted.get("info", {}).items()
-            if value in (None, "")
-        ]
+        
+        # Determine which fields are missing
+        requested_fields = extracted.get("missing", [])
+        if not requested_fields:
+            requested_fields = [
+                key
+                for key, value in extracted.get("info", {}).items()
+                if value in (None, "")
+            ]
+        
         audit_id: Optional[str] = None
         if self.audit_log:
             audit_id = self.audit_log.record(
@@ -116,41 +120,65 @@ class HumanInLoopAgent(BaseHumanAgent):
                     "info": masked_initial_info,
                 },
             )
-
-        print(
-            "Please provide missing info for event {}: {}".format(
-                masked_event.get("id", "<unknown>"), masked_initial_info
+        
+        # Build subject with audit token
+        summary = event.get("summary", "event")
+        subject = f"Missing info for {summary}"
+        if audit_id:
+            subject = f"{subject} [LeadMI #{audit_id}]"
+        
+        # Build message body
+        message = self._build_missing_info_message(event, extracted, requested_fields)
+        
+        # Send email via communication backend (EmailAgent)
+        email_agent = self._resolve_email_agent_for_reminders()
+        contact_email = contact.get("email")
+        
+        if email_agent and contact_email:
+            # Use asyncio to send email
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                # Schedule email sending
+                asyncio.create_task(
+                    email_agent.send_email_async(contact_email, subject, message)
+                )
+            except RuntimeError:
+                # No event loop running - try sync approach
+                logger.warning("No event loop available for email sending; request may be delayed")
+            
+            self._log_workflow(
+                "hitl_missing_info_pending",
+                f"Missing info request sent to {contact_email} [audit_id={audit_id or 'n/a'}]",
             )
-        )
-        # Notes: Simulate human response for demo purposes.
-        extracted["info"]["company_name"] = (
-            extracted["info"].get("company_name") or "Example Corp"
-        )
-        extracted["info"]["web_domain"] = (
-            extracted["info"].get("web_domain") or "example.com"
-        )
-        extracted["is_complete"] = True
-
-        if self.audit_log:
-            masked_completed_info = self._mask_for_message(extracted.get("info", {}))
-            response_payload = {
-                "info": masked_completed_info,
-                "is_complete": extracted.get("is_complete"),
-            }
-            outcome = "completed" if extracted.get("is_complete") else "incomplete"
-            audit_id = self.audit_log.record(
-                event_id=masked_event.get("id"),
-                request_type="missing_info",
-                stage="response",
-                responder="simulation",
-                outcome=outcome,
-                payload=response_payload,
-                audit_id=audit_id,
+            
+            # Initiate reminder sequence
+            if self.reminder_escalation and audit_id:
+                self._initiate_missing_info_reminder_sequence(
+                    audit_id=audit_id,
+                    contact=contact,
+                    subject=subject,
+                    message=message,
+                    event=event,
+                    info=extracted.get("info", {}),
+                    requested_fields=requested_fields,
+                )
+        else:
+            logger.warning(
+                "Email agent not available or no contact email; cannot send missing info request"
             )
-            if audit_id:
-                extracted["audit_id"] = audit_id
-
-        return extracted
+            self._log_workflow(
+                "hitl_missing_info_skipped",
+                f"Missing info request skipped (no email agent or contact) [audit_id={audit_id or 'n/a'}]",
+            )
+        
+        # Return pending status
+        result = dict(extracted)
+        result["status"] = "pending"
+        result["is_complete"] = False
+        result["audit_id"] = audit_id
+        
+        return result
 
     def request_dossier_confirmation(
         self, event: Dict[str, Any], info: Dict[str, Any]
@@ -181,8 +209,6 @@ class HumanInLoopAgent(BaseHumanAgent):
         contact = self._extract_organizer_contact(event)
         masked_event = self._mask_for_message(event)
         masked_info = self._mask_for_message(info)
-        subject = self._build_subject(masked_event)
-        message = self._build_message(masked_event, masked_info)
         payload = {"event": masked_event, "info": masked_info}
 
         backend_response: Optional[Any] = None
@@ -199,11 +225,30 @@ class HumanInLoopAgent(BaseHumanAgent):
                 responder=contact_label,
                 outcome="sent",
                 payload={
+                    "contact": masked_contact,
+                },
+            )
+        
+        # Build subject and message with audit token
+        subject = self._build_subject(masked_event, audit_id=audit_id)
+        message = self._build_message(masked_event, masked_info)
+        
+        # Update audit log with subject and message
+        if self.audit_log and audit_id:
+            self.audit_log.record(
+                event_id=masked_event.get("id"),
+                request_type="dossier_confirmation",
+                stage="request",
+                responder=contact_label,
+                outcome="sent",
+                payload={
                     "subject": subject,
                     "message": message,
                     "contact": masked_contact,
                 },
+                audit_id=audit_id,
             )
+        
         if handler:
             logger.debug("Sending dossier confirmation request via backend %s", handler)
             backend_response = self._call_backend_handler(
@@ -331,12 +376,15 @@ class HumanInLoopAgent(BaseHumanAgent):
         phone = organizer.get("phone") or organizer.get("phoneNumber")
         return {"email": email, "name": name, "phone": phone, "raw": organizer or None}
 
-    def _build_subject(self, event: Dict[str, Any]) -> str:
+    def _build_subject(self, event: Dict[str, Any], audit_id: Optional[str] = None) -> str:
         """
         Builds the subject line for dossier confirmation requests.
         """
         summary = event.get("summary") or "event"
-        return f"Dossier confirmation required for {summary}"
+        subject = f"Dossier confirmation required for {summary}"
+        if audit_id:
+            subject = f"{subject} [LeadMI #{audit_id}]"
+        return subject
 
     def _build_message(self, event: Dict[str, Any], info: Dict[str, Any]) -> str:
         """
@@ -662,3 +710,134 @@ class HumanInLoopAgent(BaseHumanAgent):
         if not (self.workflow_log_manager and self.run_id):
             return
         self.workflow_log_manager.append_log(self.run_id, step, message)
+
+    def _build_missing_info_message(
+        self, event: Dict[str, Any], extracted: Dict[str, Any], requested_fields: List[str]
+    ) -> str:
+        """Build message body for missing info requests."""
+        summary = event.get("summary", "Unknown event")
+        event_id = event.get("id", "<unknown>")
+        lines = [
+            "Hello,",
+            "",
+            f"We need additional information for the event: {summary} ({event_id})",
+            "",
+            "Currently extracted information:",
+        ]
+        
+        info = extracted.get("info", {})
+        for key, value in info.items():
+            display_value = value if value else "<missing>"
+            lines.append(f"- {key}: {display_value}")
+        
+        if requested_fields:
+            lines.append("")
+            lines.append("Missing required fields:")
+            for field in requested_fields:
+                lines.append(f"- {field}")
+        
+        lines.append("")
+        lines.append("Please reply with the missing information.")
+        return "\n".join(lines)
+
+    def _initiate_missing_info_reminder_sequence(
+        self,
+        *,
+        audit_id: str,
+        contact: Dict[str, Any],
+        subject: str,
+        message: str,
+        event: Dict[str, Any],
+        info: Dict[str, Any],
+        requested_fields: List[str],
+    ) -> None:
+        """Initiate reminder sequence for missing info requests."""
+        if not contact:
+            return
+        contact_email = contact.get("email")
+        if not contact_email:
+            return
+
+        if not self.reminder_escalation:
+            return
+
+        # Use business-time schedule
+        from utils.business_time import compute_delays_from_now
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        
+        try:
+            now = datetime.now(ZoneInfo("Europe/Berlin"))
+            delays = compute_delays_from_now(now)
+        except Exception as exc:
+            logger.warning(f"Failed to compute business-time schedule: {exc}")
+            # Fallback to simple delays
+            delays = [
+                {"event": "first_reminder", "delay_seconds": 3600 * 4},  # 4 hours
+                {"event": "escalation", "delay_seconds": 3600 * 24},  # 24 hours
+            ]
+
+        metadata = {
+            "audit_id": audit_id,
+            "contact": contact_email,
+            "event_id": event.get("id"),
+            "workflow_step": "hitl_missing_info",
+        }
+
+        for delay_info in delays:
+            event_name = delay_info["event"]
+            delay_seconds = delay_info["delay_seconds"]
+            
+            if event_name in ("first_reminder", "second_deadline"):
+                self.reminder_escalation.schedule_reminder(
+                    contact_email,
+                    self._build_reminder_subject(subject),
+                    self._build_reminder_message(message, attempt=1, details={}),
+                    delay_seconds,
+                    metadata={**metadata, "reminder_type": event_name},
+                )
+                self._log_workflow(
+                    f"hitl_missing_info_reminder_scheduled",
+                    f"Reminder scheduled for {contact_email} at +{delay_seconds}s [audit_id={audit_id}]",
+                )
+            elif event_name == "escalation":
+                escalation_recipient = getattr(self.reminder_policy, "escalation_recipient", None) or contact_email
+                self.reminder_escalation.schedule_escalation(
+                    escalation_recipient,
+                    self._build_escalation_subject(subject),
+                    self._build_missing_info_escalation_message(message, contact, event, info, audit_id),
+                    delay_seconds,
+                    metadata={**metadata, "escalation_recipient": escalation_recipient},
+                )
+                self._log_workflow(
+                    f"hitl_missing_info_escalation_scheduled",
+                    f"Escalation scheduled to {escalation_recipient} at +{delay_seconds}s [audit_id={audit_id}]",
+                )
+
+    def _build_missing_info_escalation_message(
+        self,
+        original_message: str,
+        contact: Dict[str, Any],
+        event: Dict[str, Any],
+        info: Dict[str, Any],
+        audit_id: str,
+    ) -> str:
+        """Build escalation message for missing info requests."""
+        event_id = event.get("id") or "<unknown>"
+        company = info.get("company_name") or info.get("web_domain") or "unknown company"
+        lines = [
+            "Escalation notice:",
+            "",
+            "The organizer has not responded to the missing information request.",
+            f"Event ID: {event_id}",
+            f"Company: {company}",
+            f"Audit trail reference: {audit_id}",
+            "",
+            "Original request message:",
+            original_message,
+            "",
+            "Please review and take the necessary action.",
+        ]
+        contact_label = self._format_contact_label(contact)
+        lines.append(f"Organizer contact: {contact_label}")
+        return "\n".join(lines)

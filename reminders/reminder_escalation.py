@@ -20,6 +20,7 @@ class ReminderEscalation:
         self.run_id = run_id
         self._task_scheduler = task_scheduler
         self._tasks: Set[asyncio.Task[Any]] = set()
+        self._tasks_by_audit: Dict[str, Set[asyncio.Task[Any]]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -145,8 +146,25 @@ class ReminderEscalation:
     def cancel_pending(self) -> None:
         tasks = list(self._tasks)
         self._tasks.clear()
+        self._tasks_by_audit.clear()
         for task in tasks:
             task.cancel()
+
+    def cancel_for_audit(self, audit_id: str) -> None:
+        """Cancel all scheduled tasks for a specific audit_id.
+        
+        Args:
+            audit_id: The audit identifier to cancel tasks for
+        """
+        if audit_id not in self._tasks_by_audit:
+            return
+        
+        tasks = list(self._tasks_by_audit[audit_id])
+        self._tasks_by_audit.pop(audit_id, None)
+        
+        for task in tasks:
+            task.cancel()
+            self._tasks.discard(task)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -161,6 +179,7 @@ class ReminderEscalation:
         metadata: Optional[Dict[str, Any]],
     ) -> asyncio.Task[bool]:
         metadata = dict(metadata or {})
+        audit_id = metadata.get("audit_id")
         due_time = datetime.now(timezone.utc) + timedelta(seconds=max(delay_seconds, 0))
         self._append_log(
             f"{action}_scheduled",
@@ -184,6 +203,9 @@ class ReminderEscalation:
             ) from exc
 
         task = loop.create_task(_execute())
+        # Store audit_id on the task for tracking
+        if audit_id:
+            setattr(task, "_audit_id", audit_id)
         tracked = self._register_task(task)
         return tracked
 
@@ -199,7 +221,24 @@ class ReminderEscalation:
                     tracked = scheduled
 
         self._tasks.add(tracked)
-        tracked.add_done_callback(self._tasks.discard)
+        
+        # Track by audit_id if present in task metadata
+        audit_id = getattr(tracked, "_audit_id", None)
+        if audit_id:
+            if audit_id not in self._tasks_by_audit:
+                self._tasks_by_audit[audit_id] = set()
+            self._tasks_by_audit[audit_id].add(tracked)
+        
+        def cleanup(t: asyncio.Task[Any]) -> None:
+            self._tasks.discard(t)
+            # Clean up from audit tracking
+            audit = getattr(t, "_audit_id", None)
+            if audit and audit in self._tasks_by_audit:
+                self._tasks_by_audit[audit].discard(t)
+                if not self._tasks_by_audit[audit]:
+                    self._tasks_by_audit.pop(audit, None)
+        
+        tracked.add_done_callback(cleanup)
         return tracked
 
     def _append_log(

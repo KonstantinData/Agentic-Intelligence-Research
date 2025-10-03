@@ -13,6 +13,7 @@ __all__ = [
     "crm_agent",
     "internal_research_agent",
     "int_lvl_1_agent",
+    "inbox_agent",
     "factory",
     "interfaces",
 ]
