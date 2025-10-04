@@ -22,6 +22,7 @@ class ReminderEscalation:
         self.run_id = run_id
         self._task_scheduler = task_scheduler
         self._tasks: Set[asyncio.Task[Any]] = set()
+        self._tasks_by_audit: Dict[str, Set[asyncio.Task[Any]]] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -144,10 +145,50 @@ class ReminderEscalation:
             metadata,
         )
 
+    def schedule_admin_recurring_reminders(
+        self,
+        admin_email: str,
+        subject: str,
+        body: str,
+        *,
+        interval_hours: float,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> asyncio.Task[bool]:
+        interval_seconds = max(0.1, float(interval_hours) * 3600.0)
+
+        async def _loop() -> bool:
+            try:
+                while True:
+                    await asyncio.sleep(interval_seconds)
+                    await self.send_reminder(
+                        admin_email, subject, body, metadata=metadata
+                    )
+            except asyncio.CancelledError:
+                return True
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError as exc:  # pragma: no cover - defensive guard
+            raise RuntimeError(
+                "Admin recurring reminders require an active event loop"
+            ) from exc
+
+        task = loop.create_task(_loop())
+        return self._register_task(task, metadata=metadata)
+
     def cancel_pending(self) -> None:
         tasks = list(self._tasks)
         self._tasks.clear()
+        self._tasks_by_audit.clear()
         for task in tasks:
+            task.cancel()
+
+    def cancel_for_audit(self, audit_id: str) -> None:
+        if not audit_id:
+            return
+        tasks = list(self._tasks_by_audit.pop(str(audit_id), set()))
+        for task in tasks:
+            self._tasks.discard(task)
             task.cancel()
 
     # ------------------------------------------------------------------
@@ -186,10 +227,12 @@ class ReminderEscalation:
             ) from exc
 
         task = loop.create_task(_execute())
-        tracked = self._register_task(task)
+        tracked = self._register_task(task, metadata=metadata)
         return tracked
 
-    def _register_task(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+    def _register_task(
+        self, task: asyncio.Task[Any], *, metadata: Optional[Dict[str, Any]] = None
+    ) -> asyncio.Task[Any]:
         tracked = task
         if self._task_scheduler:
             try:
@@ -202,6 +245,22 @@ class ReminderEscalation:
 
         self._tasks.add(tracked)
         tracked.add_done_callback(self._tasks.discard)
+
+        audit_id = None
+        if isinstance(metadata, dict):
+            audit_id = metadata.get("audit_id")
+        if audit_id:
+            key = str(audit_id)
+            bucket = self._tasks_by_audit.setdefault(key, set())
+            bucket.add(tracked)
+
+            def _cleanup(completed: asyncio.Task[Any]) -> None:
+                bucket.discard(completed)
+                if not bucket:
+                    self._tasks_by_audit.pop(key, None)
+
+            tracked.add_done_callback(_cleanup)
+
         return tracked
 
     def _append_log(

@@ -96,6 +96,7 @@ class MasterWorkflowAgent:
             resolved_overrides.get("crm"),
         )
 
+        self.on_pending_audit = None
         self.internal_research_agent = self._create_research_agent(
             resolved_overrides.get("internal_research"),
             default_name=None,
@@ -376,6 +377,31 @@ class MasterWorkflowAgent:
                     ):
                         filled = self.human_agent.request_info(event, extracted)
                     audit_id = filled.get("audit_id")
+                    status = filled.get("status")
+                    if isinstance(status, str) and status.lower() == "pending":
+                        logger.info(
+                            "Missing info request pending for event %s [audit_id=%s]",
+                            event_id,
+                            audit_id or "n/a",
+                        )
+                        record_hitl_outcome("missing_info", "pending")
+                        event_result["status"] = "missing_info_pending"
+                        if audit_id and callable(self.on_pending_audit):
+                            context = {
+                                "event": event,
+                                "info": info,
+                                "requested_fields": extracted.get("missing") or [],
+                                "run_id": self.run_id,
+                                "event_id": event_id,
+                                "kind": "missing_info",
+                            }
+                            try:
+                                self.on_pending_audit("missing_info", audit_id, context)
+                            except Exception:
+                                logger.exception(
+                                    "on_pending_audit callback failed for missing_info"
+                                )
+                        continue
                     if filled.get("is_complete"):
                         logger.info(
                             "Missing info provided for event %s [audit_id=%s]",
@@ -423,6 +449,20 @@ class MasterWorkflowAgent:
                     self._log_dossier_pending(event_id, audit_id, response)
                     record_hitl_outcome("dossier", "pending")
                     event_result["status"] = "dossier_pending"
+                    if audit_id and callable(self.on_pending_audit):
+                        context = {
+                            "event": event,
+                            "info": info,
+                            "run_id": self.run_id,
+                            "event_id": event_id,
+                            "kind": "dossier",
+                        }
+                        try:
+                            self.on_pending_audit("dossier", audit_id, context)
+                        except Exception:
+                            logger.exception(
+                                "on_pending_audit callback failed for dossier"
+                            )
                 elif response.get("dossier_required") or status == "approved":
                     logger.info(
                         "Organizer approved dossier for event %s [audit_id=%s]: %s",
@@ -463,6 +503,20 @@ class MasterWorkflowAgent:
                     self._log_dossier_pending(event_id, audit_id, response)
                     record_hitl_outcome("dossier", "pending")
                     event_result["status"] = "dossier_pending"
+                    if audit_id and callable(self.on_pending_audit):
+                        context = {
+                            "event": event,
+                            "info": info,
+                            "run_id": self.run_id,
+                            "event_id": event_id,
+                            "kind": "dossier",
+                        }
+                        try:
+                            self.on_pending_audit("dossier", audit_id, context)
+                        except Exception:
+                            logger.exception(
+                                "on_pending_audit callback failed for dossier"
+                            )
                 elif response.get("dossier_required") or status == "approved":
                     logger.info(
                         "Organizer approved dossier for event %s [audit_id=%s]: %s",
@@ -974,6 +1028,102 @@ class MasterWorkflowAgent:
             logger.exception(
                 "Failed to append research workflow log for %s", agent_name
             )
+
+    async def continue_after_missing_info(
+        self,
+        *,
+        audit_id: str,
+        fields: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> None:
+        event = context.get("event") or {}
+        base_info = context.get("info") or {}
+        merged = dict(base_info)
+        merged.update({k: v for k, v in (fields or {}).items() if v})
+        prepared = self._normalise_info_for_research(merged)
+        event_id = context.get("event_id")
+
+        if not self._has_research_inputs(prepared):
+            extracted = {
+                "info": merged,
+                "is_complete": False,
+                "status": "incomplete",
+                "missing": [
+                    key for key in ("company_name", "web_domain") if not merged.get(key)
+                ],
+            }
+            filled = self.human_agent.request_info(event, extracted)
+            new_audit_id = filled.get("audit_id")
+            if filled.get("status") == "pending" and new_audit_id and callable(
+                self.on_pending_audit
+            ):
+                next_context = dict(context)
+                next_context["info"] = merged
+                try:
+                    self.on_pending_audit("missing_info", new_audit_id, next_context)
+                except Exception:
+                    logger.exception(
+                        "on_pending_audit callback failed for follow-up missing_info"
+                    )
+            return
+
+        event_result = {"event_id": event_id, "status": "continuation"}
+        await self._process_crm_dispatch(
+            event,
+            prepared,
+            event_result,
+            event_id,
+            force_internal=True,
+        )
+
+    async def continue_after_dossier_decision(
+        self,
+        *,
+        audit_id: str,
+        decision: Optional[str],
+        context: Dict[str, Any],
+    ) -> None:
+        event = context.get("event") or {}
+        info = context.get("info") or {}
+        event_id = context.get("event_id")
+        prepared = self._normalise_info_for_research(info)
+        is_complete = self._has_research_inputs(prepared)
+
+        if decision == "approved":
+            if is_complete:
+                event_result = {"event_id": event_id, "status": "continuation"}
+                await self._process_crm_dispatch(
+                    event,
+                    prepared,
+                    event_result,
+                    event_id,
+                    force_internal=False,
+                )
+            else:
+                extracted = {
+                    "info": info,
+                    "is_complete": False,
+                    "status": "incomplete",
+                    "missing": [
+                        key for key in ("company_name", "web_domain") if not info.get(key)
+                    ],
+                }
+                filled = self.human_agent.request_info(event, extracted)
+                new_audit_id = filled.get("audit_id")
+                if filled.get("status") == "pending" and new_audit_id and callable(
+                    self.on_pending_audit
+                ):
+                    next_context = dict(context)
+                    self.on_pending_audit("missing_info", new_audit_id, next_context)
+            return
+
+        if decision == "declined":
+            logger.info("Dossier declined for event %s", event_id)
+            return
+
+        logger.info(
+            "No actionable dossier decision for audit_id=%s event=%s", audit_id, event_id
+        )
 
     def _resolve_dossier_status(self, response: Dict[str, Any]) -> str:
         status = response.get("status")

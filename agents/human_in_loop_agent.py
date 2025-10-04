@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 # Notes:
 # HumanInLoopAgent manages human-in-the-loop steps for workflows. It optionally uses a communication backend,
-# such as an EmailAgent or chat integration, to interact with event organizers. If no backend is provided,
-# the agent falls back to a deterministic simulation for demo/testing.
+# such as an EmailAgent or chat integration, to interact with event organizers. A communication backend is
+# required for production HITL workflows.
 
 
 @register_agent(BaseHumanAgent, "human_in_loop", "default", is_default=True)
@@ -43,8 +43,7 @@ class HumanInLoopAgent(BaseHumanAgent):
         communication_backend:
             A communication client (e.g. EmailAgent, Slack integration) responsible for
             contacting the event organizer. It should provide either a 'request_confirmation'
-            or 'send_confirmation_request' method. If not supplied, the agent uses a
-            deterministic simulation (useful for demos and tests).
+            or 'send_confirmation_request' method.
         """
         self.communication_backend = communication_backend
         self.audit_log: Optional[AuditLog] = None
@@ -130,6 +129,7 @@ class HumanInLoopAgent(BaseHumanAgent):
             extracted["info"].get("web_domain") or "example.com"
         )
         extracted["is_complete"] = True
+        extracted["status"] = "completed"
 
         if self.audit_log:
             masked_completed_info = self._mask_for_message(extracted.get("info", {}))
@@ -155,29 +155,7 @@ class HumanInLoopAgent(BaseHumanAgent):
     def request_dossier_confirmation(
         self, event: Dict[str, Any], info: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Ask the organizer whether a dossier should be created for the event.
-        Orchestrates interaction with the configured communication backend and always
-        returns a normalized dictionary with a boolean flag 'dossier_required' and a
-        'details' payload with contextual information.
-
-        Parameters
-        ----------
-        event: dict
-            The event dictionary.
-        info: dict
-            The extracted info dictionary.
-
-        Returns
-        -------
-        dict
-            {
-                "dossier_required": bool,
-                "details": {
-                    ...context info...
-                }
-            }
-        """
+        """Request a dossier decision from the organiser via the configured backend."""
         contact = self._extract_organizer_contact(event)
         masked_event = self._mask_for_message(event)
         masked_info = self._mask_for_message(info)
@@ -204,22 +182,21 @@ class HumanInLoopAgent(BaseHumanAgent):
                     "contact": masked_contact,
                 },
             )
-        if handler:
-            logger.debug("Sending dossier confirmation request via backend %s", handler)
-            backend_response = self._call_backend_handler(
-                handler,
-                contact=contact,
-                subject=subject,
-                message=message,
-                event=event,
-                info=info,
-                payload=payload,
+        if not handler:
+            raise RuntimeError(
+                "No communication backend configured for dossier_confirmation in production."
             )
-        else:
-            logger.debug(
-                "No communication backend configured; using simulated response."
-            )
-            backend_response = self._simulate_confirmation(contact, payload)
+
+        logger.debug("Sending dossier confirmation request via backend %s", handler)
+        backend_response = self._call_backend_handler(
+            handler,
+            contact=contact,
+            subject=subject,
+            message=message,
+            event=event,
+            info=info,
+            payload=payload,
+        )
 
         normalized = self._normalize_response(backend_response)
         details = normalized.get("details", {})
@@ -353,25 +330,6 @@ class HumanInLoopAgent(BaseHumanAgent):
         lines.append("")
         lines.append("Should we prepare a dossier for this event? Reply yes or no.")
         return "\n".join(lines)
-
-    def _simulate_confirmation(
-        self, contact: Dict[str, Any], payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Simulates dossier confirmation (used for tests or when no backend is available).
-        """
-        logger.info(
-            "Simulating dossier confirmation for organiser %s",
-            self._mask_for_message(contact).get("email"),
-        )
-        return {
-            "dossier_required": True,
-            "details": {
-                "simulation": True,
-                "reason": "Default simulated approval",
-                "contact": contact,
-            },
-        }
 
     def _normalize_response(self, response: Any) -> Dict[str, Any]:
         """

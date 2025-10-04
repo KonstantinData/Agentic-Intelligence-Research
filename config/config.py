@@ -344,6 +344,31 @@ class Settings:
             _get_env_var("OPENAI_API_BASE") or "https://api.openai.com"
         )
 
+        # SMTP configuration
+        self.smtp_host: Optional[str] = _get_env_var("SMTP_HOST")
+        self.smtp_port: int = _get_int_env("SMTP_PORT", 465)
+        self.smtp_username: Optional[str] = _get_env_var("SMTP_USER")
+        self.smtp_password: Optional[str] = _get_env_var("SMTP_PASS")
+        self.smtp_sender: Optional[str] = _get_env_var("SMTP_SENDER")
+
+        # IMAP configuration
+        self.imap_host: Optional[str] = _get_env_var("IMAP_HOST")
+        self.imap_port: int = _get_int_env("IMAP_PORT", 993)
+        self.imap_username: Optional[str] = _get_env_var("IMAP_USERNAME")
+        self.imap_password: Optional[str] = _get_env_var("IMAP_PASSWORD")
+        self.imap_use_ssl: bool = _get_bool_env("IMAP_USE_SSL", True)
+        self.imap_mailbox: str = _get_env_var("IMAP_MAILBOX") or "INBOX"
+
+        # HITL orchestration
+        self.hitl_inbox_poll_seconds: float = _get_float_env(
+            "HITL_INBOX_POLL_SECONDS", 60.0
+        )
+        self.hitl_timezone: str = _get_env_var("HITL_TIMEZONE") or "Europe/Berlin"
+        self.hitl_admin_email: Optional[str] = _get_env_var("HITL_ADMIN_EMAIL")
+        self.hitl_admin_reminder_hours: float = _get_float_env(
+            "HITL_ADMIN_REMINDER_HOURS", 24.0
+        )
+
         whitelist_env = _get_env_var("PII_FIELD_WHITELIST")
         whitelist = {
             "company_name",

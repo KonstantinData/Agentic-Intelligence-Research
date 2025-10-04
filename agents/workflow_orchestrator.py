@@ -24,8 +24,11 @@ from typing import (
 )
 
 from agents.alert_agent import AlertAgent, AlertSeverity
+from agents.inbox_agent import InboxAgent
 from agents.master_workflow_agent import MasterWorkflowAgent
 from config.config import settings
+from reminders.reminder_escalation import ReminderEscalation
+from utils.audit_log import AuditLog
 from utils.observability import (
     configure_observability,
     flush_telemetry,
@@ -80,6 +83,16 @@ class WorkflowOrchestrator:
 
         configure_observability()
 
+        self.inbox_agent = InboxAgent(
+            host=settings.imap_host,
+            port=settings.imap_port,
+            username=settings.imap_username,
+            password=settings.imap_password,
+            use_ssl=getattr(settings, "imap_use_ssl", True),
+            mailbox=getattr(settings, "imap_mailbox", "INBOX"),
+        )
+        self._resolved_audits: Set[str] = set()
+
         try:
             self.master_agent = master_agent or MasterWorkflowAgent(
                 communication_backend=communication_backend
@@ -89,6 +102,9 @@ class WorkflowOrchestrator:
             closer = getattr(self.master_agent, "aclose", None)
             if callable(closer):
                 self._register_async_cleanup("master_agent", closer)
+
+            self._install_hitl_callbacks()
+            self._start_inbox_polling()
         except EnvironmentError as exc:
             logger.error("Failed to initialise MasterWorkflowAgent: %s", exc)
             self.master_agent = None
@@ -133,6 +149,169 @@ class WorkflowOrchestrator:
 
         task.add_done_callback(_discard)
         return task
+
+    # ------------------------------------------------------------------
+    # HITL orchestration helpers
+    # ------------------------------------------------------------------
+    def _install_hitl_callbacks(self) -> None:
+        if not self.master_agent:
+            return
+
+        def on_pending(kind: str, audit_id: str, context: Dict[str, Any]) -> None:
+            async def _handle_reply(message) -> None:
+                if self._is_audit_resolved(audit_id):
+                    return
+
+                self._mark_audit_resolved(audit_id)
+                normalized = self._normalize_incoming_reply(kind, message)
+                normalized.setdefault("event_id", context.get("event_id"))
+                self._record_audit_response(audit_id, kind, message, normalized, context)
+                self._cancel_reminders_for(audit_id)
+
+                try:
+                    await self._continue_after_reply(kind, audit_id, normalized, context)
+                except Exception:
+                    # Allow retries when continuation fails by clearing resolved state.
+                    self._resolved_audits.discard(audit_id)
+                    raise
+
+            try:
+                self.inbox_agent.register_reply_handler(audit_id, _handle_reply)
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Failed to register inbox reply handler for audit_id=%s", audit_id
+                )
+
+        self.master_agent.on_pending_audit = on_pending
+
+    def _start_inbox_polling(self) -> None:
+        if not self.inbox_agent.is_configured():
+            logger.info("InboxAgent not configured; skipping polling startup")
+            return
+
+        interval = getattr(settings, "hitl_inbox_poll_seconds", 60.0)
+        try:
+            task = asyncio.create_task(
+                self.inbox_agent.start_polling_loop(interval_seconds=interval)
+            )
+        except RuntimeError:
+            logger.exception("Unable to start inbox polling loop")
+            return
+
+        self.track_background_task(task)
+
+    def _is_audit_resolved(self, audit_id: str) -> bool:
+        return audit_id in self._resolved_audits
+
+    def _mark_audit_resolved(self, audit_id: str) -> None:
+        self._resolved_audits.add(audit_id)
+
+    def _cancel_reminders_for(self, audit_id: str) -> None:
+        if not self.master_agent:
+            return
+        human_agent = getattr(self.master_agent, "human_agent", None)
+        reminder: Optional[ReminderEscalation] = getattr(
+            human_agent, "reminder_escalation", None
+        )
+        if reminder and hasattr(reminder, "cancel_for_audit"):
+            try:
+                reminder.cancel_for_audit(audit_id)
+            except Exception:  # pragma: no cover - defensive logging
+                logger.exception(
+                    "Failed to cancel reminders for audit_id=%s", audit_id
+                )
+
+    def _record_audit_response(
+        self,
+        audit_id: str,
+        kind: str,
+        message,
+        normalized: Dict[str, Any],
+        context: Mapping[str, Any],
+    ) -> None:
+        if not self.master_agent:
+            return
+        audit_log: Optional[AuditLog] = getattr(self.master_agent, "audit_log", None)
+        if not audit_log:
+            return
+
+        body_text = (message.body or "") if getattr(message, "body", None) else ""
+        payload = {
+            "kind": kind,
+            "from": getattr(message, "from_addr", None),
+            "subject": getattr(message, "subject", None),
+            "body_preview": body_text[:500],
+            "normalized": normalized,
+        }
+        event_id = context.get("event_id")
+
+        try:
+            audit_log.record(
+                event_id=str(event_id) if event_id is not None else None,
+                request_type="hitl_response",
+                stage="response",
+                responder=getattr(message, "from_addr", None) or "unknown",
+                outcome=normalized.get("outcome") or "received",
+                payload=payload,
+                audit_id=audit_id,
+            )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Failed to record audit response for audit_id=%s", audit_id)
+
+    def _normalize_incoming_reply(self, kind: str, message) -> Dict[str, Any]:
+        body = getattr(message, "body", None) or ""
+        if kind == "dossier":
+            decision = self.inbox_agent.parse_dossier_decision(body)
+            return {
+                "type": "dossier",
+                "decision": decision,
+                "outcome": decision or "pending",
+            }
+        if kind == "missing_info":
+            fields = self.inbox_agent.parse_missing_info_key_values(body)
+            return {
+                "type": "missing_info",
+                "fields": fields,
+                "outcome": "fields_received" if fields else "pending",
+            }
+        return {"type": kind, "outcome": "unknown"}
+
+    async def _continue_after_reply(
+        self,
+        kind: str,
+        audit_id: str,
+        normalized: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> None:
+        if not self.master_agent:
+            logger.warning(
+                "No master agent available to continue workflow for audit_id=%s", audit_id
+            )
+            return
+
+        try:
+            if kind == "dossier":
+                decision = normalized.get("decision")
+                await self.master_agent.continue_after_dossier_decision(
+                    audit_id=audit_id,
+                    decision=decision,
+                    context=dict(context),
+                )
+            elif kind == "missing_info":
+                fields = normalized.get("fields") or {}
+                await self.master_agent.continue_after_missing_info(
+                    audit_id=audit_id,
+                    fields=dict(fields),
+                    context=dict(context),
+                )
+            else:
+                logger.info(
+                    "Unhandled reply type '%s' for audit_id=%s", kind, audit_id
+                )
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Continuation after reply failed for audit_id=%s", audit_id
+            )
 
     def install_signal_handlers(
         self, loop: Optional[asyncio.AbstractEventLoop] = None
